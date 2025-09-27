@@ -10,7 +10,7 @@ export class TelegramController {
   @Post('webhook')
   async webhook(@Body() update: any) {
     this.logger.log('Received webhook update:', JSON.stringify(update, null, 2));
-    
+
     try {
       await this.telegramService.handleUpdate(update);
       return { status: 'ok' };
@@ -20,3 +20,4 @@ export class TelegramController {
     }
   }
 }
+

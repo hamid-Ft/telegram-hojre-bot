@@ -1,8 +1,9 @@
+import { Context, Telegraf } from 'telegraf';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+
 import { ConfigService } from '@nestjs/config';
-import { Telegraf, Context } from 'telegraf';
-import { TimeTrackingService } from './time-tracking.service';
 import { ReportService } from './report.service';
+import { TimeTrackingService } from './time-tracking.service';
 import { UserService } from './user.service';
 
 interface TelegramContext extends Context {
@@ -50,7 +51,7 @@ export class TelegramService implements OnModuleInit {
 
 Available commands:
 📍 /checkin - Record your arrival time
-📤 /checkout - Record your departure time  
+📤 /checkout - Record your departure time
 📊 /status - View today's work status
 📈 /report daily - Today's work summary
 📈 /report weekly - This week's summary
@@ -69,7 +70,7 @@ Let's start tracking your work hours! 🚀
       try {
         const user = ctx.from;
         await this.userService.createOrUpdateUser(user);
-        
+
         const result = await this.timeTrackingService.checkIn(
           user.id.toString(),
           new Date(),
@@ -186,7 +187,7 @@ Let's start tracking your work hours! 🚀
 
 **Reports:**
 📈 /report daily - Today's work summary
-📈 /report weekly - This week's summary  
+📈 /report weekly - This week's summary
 📈 /report monthly - This month's summary
 📈 /report range 2024-01-01 2024-01-31 - Custom date range
 

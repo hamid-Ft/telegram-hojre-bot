@@ -5,10 +5,10 @@ FROM node:18-alpine AS builder
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package.json ./
 
-# Install all dependencies (including devDependencies for build)
-RUN npm install
+# Update npm to latest version and install dependencies
+RUN npm install -g npm@latest && npm install
 
 # Copy source code
 COPY . .
@@ -26,10 +26,10 @@ RUN apk add --no-cache curl
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package.json ./
 
-# Install only production dependencies
-RUN npm install --only=production && npm cache clean --force
+# Update npm and install only production dependencies
+RUN npm install -g npm@latest && npm install --omit=dev && npm cache clean --force
 
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist
