@@ -20,41 +20,35 @@ import { AppController } from './app.controller';
 import { TelegramController } from './controllers/telegram.controller';
 
 @Module({
-  imports: [
-    // Configuration
-    ConfigModule.forRoot({
-      isGlobal: true,
-      envFilePath: ['.env.local', '.env'],
-    }),
+	imports: [
+		// Configuration
+		ConfigModule.forRoot({
+			isGlobal: true,
+			envFilePath: ['.env.local', '.env'],
+		}),
 
-    // Database
-    TypeOrmModule.forRootAsync({
-      useFactory: () => ({
-        type: 'postgres',
-        url: process.env.DATABASE_URL,
-        ssl: {
-          rejectUnauthorized: false,
-        },
-        entities: [User, TimeEntry, WorkSession],
-        synchronize: process.env.NODE_ENV !== 'production',
-        logging: process.env.NODE_ENV === 'development',
-      }),
-    }),
+		// Database
+		TypeOrmModule.forRootAsync({
+			useFactory: () => ({
+				type: 'postgres',
+				url: process.env.DATABASE_URL,
+				ssl: {
+					rejectUnauthorized: false,
+				},
+				entities: [User, TimeEntry, WorkSession],
+				synchronize: process.env.NODE_ENV !== 'production',
+				logging: process.env.NODE_ENV === 'development',
+			}),
+		}),
 
-    // Entity repositories
-    TypeOrmModule.forFeature([User, TimeEntry, WorkSession]),
+		// Entity repositories
+		TypeOrmModule.forFeature([User, TimeEntry, WorkSession]),
 
-    // Scheduling
-    ScheduleModule.forRoot(),
-  ],
+		// Scheduling
+		ScheduleModule.forRoot(),
+	],
 
-  controllers: [AppController, TelegramController],
-  providers: [
-    TelegramService,
-    UserService,
-    TimeTrackingService,
-    ReportService,
-    SchedulerService,
-  ],
+	controllers: [AppController, TelegramController],
+	providers: [TelegramService, UserService, TimeTrackingService, ReportService, SchedulerService],
 })
 export class AppModule {}

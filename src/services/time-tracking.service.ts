@@ -1,296 +1,205 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Between, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import * as moment from 'moment-timezone';
+
 import { TimeEntry, EntryType } from '../entities/time-entry.entity';
 import { WorkSession } from '../entities/work-session.entity';
 import { UserService } from './user.service';
 
 interface TimeTrackingResult {
-  success: boolean;
-  message: string;
-  formattedTime?: string;
-  date?: string;
-  totalHours?: string;
+	success: boolean;
+	message: string;
+	formattedTime?: string;
+	date?: string;
+	totalHours?: string;
 }
 
 @Injectable()
 export class TimeTrackingService {
-  constructor(
-    @InjectRepository(TimeEntry)
-    private timeEntryRepository: Repository<TimeEntry>,
-    @InjectRepository(WorkSession)
-    private workSessionRepository: Repository<WorkSession>,
-    private userService: UserService,
-    private configService: ConfigService,
-  ) {}
+	constructor(
+		@InjectRepository(TimeEntry) private timeEntryRepo: Repository<TimeEntry>,
+		@InjectRepository(WorkSession) private workSessionRepo: Repository<WorkSession>,
+		private users: UserService,
+		private config: ConfigService
+	) {}
 
-  async checkIn(
-    telegramId: string,
-    timestamp: Date,
-    messageId?: string,
-    note?: string,
-  ): Promise<TimeTrackingResult> {
-    try {
-      const user = await this.userService.findByTelegramId(telegramId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found. Please start the bot first with /start',
-        };
-      }
+	private dayBounds(ts: Date, tz: string) {
+		const start = moment.tz(ts, tz).startOf('day').toDate();
+		const end = moment.tz(ts, tz).endOf('day').toDate();
+		return { start, end };
+	}
 
-      const today = moment.tz(timestamp, user.timezone).format('YYYY-MM-DD');
-      const formattedTime = moment.tz(timestamp, user.timezone).format('HH:mm');
+	private accumulateHours(entries: TimeEntry[]) {
+		const sorted = [...entries].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+		let total = 0;
+		let openIn: Date | null = null;
 
-      // Check if already checked in today
-      const existingCheckIn = await this.timeEntryRepository.findOne({
-        where: {
-          telegramId,
-          type: EntryType.CHECK_IN,
-          timestamp: moment.tz(timestamp, user.timezone).startOf('day').toDate(),
-        },
-        order: { timestamp: 'DESC' },
-      });
+		for (const e of sorted) {
+			if (e.type === EntryType.CHECK_IN) {
+				if (!openIn) openIn = e.timestamp;
+			} else if (e.type === EntryType.CHECK_OUT) {
+				if (openIn) {
+					total += moment(e.timestamp).diff(moment(openIn), 'minutes') / 60;
+					openIn = null;
+				}
+			}
+		}
+		return parseFloat(total.toFixed(2));
+	}
 
-      // More flexible check - look for today's entries
-      const todayEntries = await this.timeEntryRepository.find({
-        where: {
-          telegramId,
-          timestamp: moment.tz(today, user.timezone).toDate(),
-        },
-        order: { timestamp: 'DESC' },
-      });
+	async checkIn(telegramId: string, ts: Date, messageId?: string, note?: string): Promise<TimeTrackingResult> {
+		try {
+			const user = await this.users.findByTelegramId(telegramId);
+			if (!user) return { success: false, message: 'User not found. Please start the bot first with /start' };
 
-      const todayCheckIns = todayEntries.filter(e => e.type === EntryType.CHECK_IN);
-      const todayCheckOuts = todayEntries.filter(e => e.type === EntryType.CHECK_OUT);
+			const { start, end } = this.dayBounds(ts, user.timezone);
+			const today = moment.tz(ts, user.timezone).format('YYYY-MM-DD');
+			const formattedTime = moment.tz(ts, user.timezone).format('HH:mm');
 
-      // If there are more check-ins than check-outs, user is already checked in
-      if (todayCheckIns.length > todayCheckOuts.length) {
-        const lastCheckIn = todayCheckIns[0];
-        const lastCheckInTime = moment.tz(lastCheckIn.timestamp, user.timezone).format('HH:mm');
-        return {
-          success: false,
-          message: `You're already checked in today at ${lastCheckInTime}. Please check out first.`,
-        };
-      }
+			const todayEntries = await this.timeEntryRepo.find({
+				where: { telegramId, timestamp: Between(start, end) },
+				order: { timestamp: 'ASC' },
+			});
 
-      // Create check-in entry
-      const checkInEntry = this.timeEntryRepository.create({
-        telegramId,
-        type: EntryType.CHECK_IN,
-        timestamp,
-        note,
-        messageId,
-      });
+			const todayIns = todayEntries.filter((e) => e.type === EntryType.CHECK_IN);
+			const todayOuts = todayEntries.filter((e) => e.type === EntryType.CHECK_OUT);
 
-      await this.timeEntryRepository.save(checkInEntry);
+			if (todayIns.length > todayOuts.length) {
+				const lastIn = todayIns[todayIns.length - 1];
+				const lastInTime = moment.tz(lastIn.timestamp, user.timezone).format('HH:mm');
+				return {
+					success: false,
+					message: `You're already checked in today at ${lastInTime}. Please check out first.`,
+				};
+			}
 
-      // Create or update work session
-      await this.updateWorkSession(telegramId, today, user.timezone);
+			await this.timeEntryRepo.save(
+				this.timeEntryRepo.create({
+					telegramId,
+					type: EntryType.CHECK_IN,
+					timestamp: ts,
+					note,
+					messageId,
+				})
+			);
 
-      return {
-        success: true,
-        message: 'Checked in successfully!',
-        formattedTime,
-        date: moment.tz(timestamp, user.timezone).format('YYYY-MM-DD'),
-      };
-    } catch (error) {
-      console.error('Check-in error:', error);
-      return {
-        success: false,
-        message: 'An error occurred during check-in. Please try again.',
-      };
-    }
-  }
+			await this.updateWorkSession(telegramId, today, user.timezone);
+			return { success: true, message: 'Checked in successfully!', formattedTime, date: today };
+		} catch (e) {
+			// eslint-disable-next-line no-console
+			console.error('Check-in error:', e);
+			return { success: false, message: 'An error occurred during check-in. Please try again.' };
+		}
+	}
 
-  async checkOut(
-    telegramId: string,
-    timestamp: Date,
-    messageId?: string,
-    note?: string,
-  ): Promise<TimeTrackingResult> {
-    try {
-      const user = await this.userService.findByTelegramId(telegramId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found. Please start the bot first with /start',
-        };
-      }
+	async checkOut(telegramId: string, ts: Date, messageId?: string, note?: string): Promise<TimeTrackingResult> {
+		try {
+			const user = await this.users.findByTelegramId(telegramId);
+			if (!user) return { success: false, message: 'User not found. Please start the bot first with /start' };
 
-      const today = moment.tz(timestamp, user.timezone).format('YYYY-MM-DD');
-      const formattedTime = moment.tz(timestamp, user.timezone).format('HH:mm');
+			const { start, end } = this.dayBounds(ts, user.timezone);
+			const today = moment.tz(ts, user.timezone).format('YYYY-MM-DD');
+			const formattedTime = moment.tz(ts, user.timezone).format('HH:mm');
 
-      // Get today's entries
-      const startOfDay = moment.tz(today, user.timezone).startOf('day').toDate();
-      const endOfDay = moment.tz(today, user.timezone).endOf('day').toDate();
+			const todayEntries = await this.timeEntryRepo.find({
+				where: { telegramId, timestamp: Between(start, end) },
+				order: { timestamp: 'ASC' },
+			});
 
-      const todayEntries = await this.timeEntryRepository.find({
-        where: {
-          telegramId,
-          timestamp: moment.tz(timestamp, user.timezone).toDate(),
-        },
-        order: { timestamp: 'ASC' },
-      });
+			const ins = todayEntries.filter((e) => e.type === EntryType.CHECK_IN);
+			const outs = todayEntries.filter((e) => e.type === EntryType.CHECK_OUT);
 
-      const checkIns = todayEntries.filter(e => e.type === EntryType.CHECK_IN);
-      const checkOuts = todayEntries.filter(e => e.type === EntryType.CHECK_OUT);
+			if (ins.length === 0) {
+				return { success: false, message: 'You need to check in first before checking out.' };
+			}
+			if (outs.length >= ins.length) {
+				return { success: false, message: 'You are already checked out. Use /checkin to start a new session.' };
+			}
 
-      if (checkIns.length === 0) {
-        return {
-          success: false,
-          message: 'You need to check in first before checking out.',
-        };
-      }
+			await this.timeEntryRepo.save(
+				this.timeEntryRepo.create({
+					telegramId,
+					type: EntryType.CHECK_OUT,
+					timestamp: ts,
+					note,
+					messageId,
+				})
+			);
 
-      if (checkOuts.length >= checkIns.length) {
-        return {
-          success: false,
-          message: 'You are already checked out. Use /checkin to start a new session.',
-        };
-      }
+			const session = await this.updateWorkSession(telegramId, today, user.timezone);
+			return {
+				success: true,
+				message: 'Checked out successfully!',
+				formattedTime,
+				date: today,
+				totalHours: session.totalHours.toString(),
+			};
+		} catch (e) {
+			// eslint-disable-next-line no-console
+			console.error('Check-out error:', e);
+			return { success: false, message: 'An error occurred during check-out. Please try again.' };
+		}
+	}
 
-      // Create check-out entry
-      const checkOutEntry = this.timeEntryRepository.create({
-        telegramId,
-        type: EntryType.CHECK_OUT,
-        timestamp,
-        note,
-        messageId,
-      });
+	async getTodayStatus(telegramId: string): Promise<string> {
+		try {
+			const user = await this.users.findByTelegramId(telegramId);
+			if (!user) return '❌ User not found. Please start the bot with /start';
 
-      await this.timeEntryRepository.save(checkOutEntry);
+			const today = moment.tz(user.timezone).format('YYYY-MM-DD');
+			const ws = await this.workSessionRepo.findOne({ where: { telegramId, date: today } });
 
-      // Update work session
-      const workSession = await this.updateWorkSession(telegramId, today, user.timezone);
+			if (!ws) {
+				return `📅 **Today's Status (${today})**\n\n📍 Status: Not checked in\n⏱️ Total hours: 0.00\n\nUse /checkin to start tracking your work time! 🚀`;
+			}
 
-      return {
-        success: true,
-        message: 'Checked out successfully!',
-        formattedTime,
-        date: today,
-        totalHours: workSession.totalHours.toString(),
-      };
-    } catch (error) {
-      console.error('Check-out error:', error);
-      return {
-        success: false,
-        message: 'An error occurred during check-out. Please try again.',
-      };
-    }
-  }
+			const working = !!ws.checkIn && !ws.checkOut;
+			const statusIcon = working ? '🟢' : ws.isComplete ? '✅' : '🟡';
+			const statusText = working ? 'Currently working' : ws.isComplete ? 'Completed' : 'Partially logged';
 
-  async getTodayStatus(telegramId: string): Promise<string> {
-    try {
-      const user = await this.userService.findByTelegramId(telegramId);
-      if (!user) {
-        return '❌ User not found. Please start the bot with /start';
-      }
+			let msg = `📅 **Today's Status (${today})**\n\n${statusIcon} Status: ${statusText}\n`;
+			if (ws.checkIn) msg += `📍 Check-in: ${moment.tz(ws.checkIn, user.timezone).format('HH:mm')}\n`;
+			if (ws.checkOut) msg += `📤 Check-out: ${moment.tz(ws.checkOut, user.timezone).format('HH:mm')}\n`;
+			msg += `⏱️ Total hours: ${parseFloat(ws.totalHours.toString()).toFixed(2)}\n`;
 
-      const today = moment.tz(user.timezone).format('YYYY-MM-DD');
-      const workSession = await this.workSessionRepository.findOne({
-        where: { telegramId, date: today },
-      });
+			if (working) {
+				const current = moment.duration(moment().diff(ws.checkIn)).asHours();
+				msg += `\n🕐 Currently working for: ${current.toFixed(1)} hours`;
+			}
+			return msg;
+		} catch (e) {
+			// eslint-disable-next-line no-console
+			console.error('Status error:', e);
+			return '❌ An error occurred while fetching your status.';
+		}
+	}
 
-      if (!workSession) {
-        return `📅 **Today's Status (${today})**\n\n` +
-               `📍 Status: Not checked in\n` +
-               `⏱️ Total hours: 0.00\n\n` +
-               `Use /checkin to start tracking your work time! 🚀`;
-      }
+	private async updateWorkSession(telegramId: string, date: string, tz: string): Promise<WorkSession> {
+		let ws = await this.workSessionRepo.findOne({ where: { telegramId, date } });
+		if (!ws) {
+			ws = this.workSessionRepo.create({ telegramId, date, totalHours: 0, breakMinutes: 0, isComplete: false });
+		}
 
-      const isCurrentlyWorking = workSession.checkIn && !workSession.checkOut;
-      const statusIcon = isCurrentlyWorking ? '🟢' : workSession.isComplete ? '✅' : '🟡';
-      const statusText = isCurrentlyWorking ? 'Currently working' : 
-                        workSession.isComplete ? 'Completed' : 'Partially logged';
+		const start = moment.tz(date, tz).startOf('day').toDate();
+		const end = moment.tz(date, tz).endOf('day').toDate();
 
-      let message = `📅 **Today's Status (${today})**\n\n`;
-      message += `${statusIcon} Status: ${statusText}\n`;
+		const entries = await this.timeEntryRepo.find({
+			where: { telegramId, timestamp: Between(start, end) },
+			order: { timestamp: 'ASC' },
+		});
 
-      if (workSession.checkIn) {
-        const checkInTime = moment.tz(workSession.checkIn, user.timezone).format('HH:mm');
-        message += `📍 Check-in: ${checkInTime}\n`;
-      }
+		const firstIn = entries.find((e) => e.type === EntryType.CHECK_IN)?.timestamp ?? null;
+		const lastOut = [...entries].reverse().find((e) => e.type === EntryType.CHECK_OUT)?.timestamp ?? null;
 
-      if (workSession.checkOut) {
-        const checkOutTime = moment.tz(workSession.checkOut, user.timezone).format('HH:mm');
-        message += `📤 Check-out: ${checkOutTime}\n`;
-      }
+		ws.checkIn = firstIn;
+		ws.checkOut = lastOut;
+		ws.totalHours = this.accumulateHours(entries);
 
-      message += `⏱️ Total hours: ${parseFloat(workSession.totalHours.toString()).toFixed(2)}\n`;
+		const last = entries[entries.length - 1];
+		ws.isComplete = !!last && last.type === EntryType.CHECK_OUT;
 
-      if (workSession.breaks && workSession.breaks.length > 0) {
-        message += `☕ Break time: ${workSession.breakMinutes} minutes\n`;
-      }
-
-      if (isCurrentlyWorking) {
-        const currentDuration = moment.duration(moment().diff(workSession.checkIn)).asHours();
-        message += `\n🕐 Currently working for: ${currentDuration.toFixed(1)} hours`;
-      }
-
-      return message;
-    } catch (error) {
-      console.error('Status error:', error);
-      return '❌ An error occurred while fetching your status.';
-    }
-  }
-
-  private async updateWorkSession(
-    telegramId: string,
-    date: string,
-    timezone: string,
-  ): Promise<WorkSession> {
-    let workSession = await this.workSessionRepository.findOne({
-      where: { telegramId, date },
-    });
-
-    if (!workSession) {
-      workSession = this.workSessionRepository.create({
-        telegramId,
-        date,
-        totalHours: 0,
-        breakMinutes: 0,
-        isComplete: false,
-      });
-    }
-
-    // Get all entries for this day
-    const startOfDay = moment.tz(date, timezone).startOf('day').toDate();
-    const endOfDay = moment.tz(date, timezone).endOf('day').toDate();
-
-    const entries = await this.timeEntryRepository.find({
-      where: {
-        telegramId,
-        timestamp: startOfDay, // This might need adjustment for proper date range query
-      },
-      order: { timestamp: 'ASC' },
-    });
-
-    const checkIns = entries.filter(e => e.type === EntryType.CHECK_IN);
-    const checkOuts = entries.filter(e => e.type === EntryType.CHECK_OUT);
-
-    if (checkIns.length > 0) {
-      workSession.checkIn = checkIns[0].timestamp;
-    }
-
-    if (checkOuts.length > 0) {
-      workSession.checkOut = checkOuts[checkOuts.length - 1].timestamp;
-    }
-
-    // Calculate total hours
-    if (workSession.checkIn && workSession.checkOut) {
-      const duration = moment.duration(moment(workSession.checkOut).diff(moment(workSession.checkIn)));
-      workSession.totalHours = parseFloat(duration.asHours().toFixed(2));
-      workSession.isComplete = true;
-    } else if (workSession.checkIn) {
-      // Currently working - calculate current duration
-      const duration = moment.duration(moment().diff(moment(workSession.checkIn)));
-      workSession.totalHours = parseFloat(duration.asHours().toFixed(2));
-      workSession.isComplete = false;
-    }
-
-    return await this.workSessionRepository.save(workSession);
-  }
+		return this.workSessionRepo.save(ws);
+	}
 }
