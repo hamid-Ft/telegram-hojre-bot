@@ -1,4 +1,4 @@
-import { Context, Telegraf, session } from 'telegraf';
+import { Context, Telegraf } from 'telegraf';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as moment from 'moment-timezone';
@@ -16,19 +16,17 @@ interface FlowState {
 	threadId?: number;
 }
 
-interface TelegramSession {
-	flow?: FlowState;
-}
-
 interface TelegramContext extends Context {
 	match?: RegExpExecArray | null;
-	session: TelegramSession;
 }
 
 @Injectable()
 export class TelegramService implements OnModuleInit {
 	private readonly logger = new Logger(TelegramService.name);
 	private bot: Telegraf<TelegramContext>;
+
+	// Simple in-memory flow store: chatId:userId:threadId -> FlowState
+	private flows = new Map<string, FlowState>();
 
 	constructor(
 		private config: ConfigService,
@@ -40,9 +38,6 @@ export class TelegramService implements OnModuleInit {
 		if (!token) throw new Error('TELEGRAM_BOT_TOKEN is required');
 
 		this.bot = new Telegraf<TelegramContext>(token);
-		// Enable per-user session for flows
-		this.bot.use(session());
-
 		this.setupCommandsAndFlows();
 	}
 
@@ -67,20 +62,35 @@ export class TelegramService implements OnModuleInit {
 
 	// ---------- helpers ----------
 
-	/** Extract current topic/thread id from any update type */
 	private getThreadId(ctx: TelegramContext): number | undefined {
 		const m: any = (ctx as any).message ?? (ctx as any).callbackQuery?.message;
 		return m?.message_thread_id as number | undefined;
 	}
 
-	/** Reply into the same topic/thread */
+	private getKey(ctx: TelegramContext): string {
+		const chatId = ctx.chat?.id ?? 0;
+		const userId = ctx.from?.id ?? 0;
+		const threadId = this.getThreadId(ctx) ?? 0;
+		return `${chatId}:${userId}:${threadId}`;
+	}
+
+	private getFlow(ctx: TelegramContext): FlowState | undefined {
+		return this.flows.get(this.getKey(ctx));
+	}
+
+	private setFlow(ctx: TelegramContext, flow: FlowState | undefined) {
+		const key = this.getKey(ctx);
+		if (flow) this.flows.set(key, flow);
+		else this.flows.delete(key);
+	}
+
 	private async replyInThread(
 		ctx: TelegramContext,
 		text: string,
 		extra: Parameters<Telegraf<TelegramContext>['telegram']['sendMessage']>[2] = {}
 	) {
 		const chatId = ctx.chat!.id;
-		const threadId = this.getThreadId(ctx) ?? ctx.session?.flow?.threadId;
+		const threadId = this.getThreadId(ctx) ?? this.getFlow(ctx)?.threadId;
 		const options = { ...extra, ...(threadId ? { message_thread_id: threadId } : {}) };
 		return ctx.telegram.sendMessage(chatId, text, options);
 	}
@@ -93,7 +103,6 @@ export class TelegramService implements OnModuleInit {
 		);
 	}
 
-	/** Parse YYYY-MM-DD or the literal 'today' (in user's TZ). Returns ISO date string. */
 	private parseDateOrToday(s: string, tz: string): string | null {
 		const t = s.trim().toLowerCase();
 		if (t === 'today') return moment.tz(tz).format('YYYY-MM-DD');
@@ -101,14 +110,12 @@ export class TelegramService implements OnModuleInit {
 		return t;
 	}
 
-	/** Parse HH:mm (24h). Returns {hh, mm} or null. */
 	private parseHHmm(s: string): { hh: number; mm: number } | null {
 		const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(s.trim());
 		if (!m) return null;
 		return { hh: parseInt(m[1], 10), mm: parseInt(m[2], 10) };
 	}
 
-	/** Build Date in user's TZ from local yyyy-mm-dd + hh:mm */
 	private toUserDate(dateStr: string, hh: number, mm: number, tz: string): Date {
 		return moment.tz(dateStr, 'YYYY-MM-DD', tz).hour(hh).minute(mm).second(0).millisecond(0).toDate();
 	}
@@ -139,7 +146,7 @@ export class TelegramService implements OnModuleInit {
 			await this.replyInThread(ctx, welcome, { parse_mode: 'Markdown' });
 		});
 
-		// Quick now checkin/checkout (kept)
+		// Quick now checkin/checkout
 		this.bot.command('checkin', async (ctx) => {
 			try {
 				await this.users.createOrUpdateUser(ctx.from);
@@ -214,7 +221,7 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// /menu — inline menu launches FLOWS (forms)
+		// /menu — inline menu launches flows
 		this.bot.command('menu', async (ctx) => {
 			const threadId = this.getThreadId(ctx);
 			await ctx.telegram.sendMessage(ctx.chat!.id, 'Choose an action:', {
@@ -231,7 +238,7 @@ export class TelegramService implements OnModuleInit {
 			});
 		});
 
-		// ---------- Inline actions (status + start flows) ----------
+		// --- Inline actions (status + start flows)
 
 		this.bot.action('do_status', async (ctx) => {
 			try {
@@ -250,11 +257,11 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// Start manual check-in flow
 		this.bot.action('flow_checkin_manual', async (ctx) => {
 			try {
 				this.logCallback(ctx, 'flow_checkin_manual');
-				ctx.session.flow = { name: 'checkin_manual', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				const flow: FlowState = { name: 'checkin_manual', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				this.setFlow(ctx, flow);
 				await ctx.answerCbQuery();
 				await this.replyInThread(ctx, '📅 *Check-in (manual)*\nSend *date* as `YYYY-MM-DD` or type `today`.', {
 					parse_mode: 'Markdown',
@@ -268,11 +275,11 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// Start manual check-out flow
 		this.bot.action('flow_checkout_manual', async (ctx) => {
 			try {
 				this.logCallback(ctx, 'flow_checkout_manual');
-				ctx.session.flow = { name: 'checkout_manual', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				const flow: FlowState = { name: 'checkout_manual', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				this.setFlow(ctx, flow);
 				await ctx.answerCbQuery();
 				await this.replyInThread(ctx, '📅 *Check-out (manual)*\nSend *date* as `YYYY-MM-DD` or type `today`.', {
 					parse_mode: 'Markdown',
@@ -286,11 +293,11 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// Start my report flow
 		this.bot.action('flow_my_report_range', async (ctx) => {
 			try {
 				this.logCallback(ctx, 'flow_my_report_range');
-				ctx.session.flow = { name: 'my_report_range', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				const flow: FlowState = { name: 'my_report_range', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				this.setFlow(ctx, flow);
 				await ctx.answerCbQuery();
 				await this.replyInThread(ctx, '📊 *My report*\nStart date? `YYYY-MM-DD`', { parse_mode: 'Markdown' });
 			} catch (e) {
@@ -302,11 +309,16 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// Start user report flow
 		this.bot.action('flow_user_report_range', async (ctx) => {
 			try {
 				this.logCallback(ctx, 'flow_user_report_range');
-				ctx.session.flow = { name: 'user_report_range', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				const flow: FlowState = {
+					name: 'user_report_range',
+					step: 1,
+					data: {},
+					threadId: this.getThreadId(ctx),
+				};
+				this.setFlow(ctx, flow);
 				await ctx.answerCbQuery();
 				await this.replyInThread(
 					ctx,
@@ -322,36 +334,36 @@ export class TelegramService implements OnModuleInit {
 			}
 		});
 
-		// ---------- Flow processor ----------
+		// ---------- Flow processor (text messages) ----------
 
 		this.bot.on('text', async (ctx, next) => {
-			const s = ctx.session.flow;
-			if (!s) return next();
+			const flow = this.getFlow(ctx);
+			if (!flow) return next();
 
-			const meId = String(ctx.from.id);
+			const meId = String(ctx.from!.id);
 			const me = await this.users.findByTelegramId(meId);
 			const tz = me?.timezone ?? this.config.get('TIMEZONE') ?? 'Asia/Tehran';
 
 			try {
-				// CHECK-IN (manual): date -> time -> save
-				if (s.name === 'checkin_manual') {
-					if (s.step === 1) {
+				if (flow.name === 'checkin_manual') {
+					if (flow.step === 1) {
 						const d = this.parseDateOrToday(ctx.message.text, tz);
 						if (!d) return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD` or `today`.');
-						s.data.date = d;
-						s.step = 2;
+						flow.data.date = d;
+						flow.step = 2;
+						this.setFlow(ctx, flow);
 						return this.replyInThread(ctx, '⏰ Time? `HH:mm` (24h)');
 					}
-					if (s.step === 2) {
+					if (flow.step === 2) {
 						const t = this.parseHHmm(ctx.message.text);
 						if (!t) return this.replyInThread(ctx, '❌ Use `HH:mm` (e.g., 09:15).');
-						const ts = this.toUserDate(s.data.date, t.hh, t.mm, tz);
+						const ts = this.toUserDate(flow.data.date, t.hh, t.mm, tz);
 						const r = await this.timeTracking.checkIn(
 							meId,
 							ts,
 							String((ctx.message as any)?.message_id ?? '')
 						);
-						ctx.session.flow = undefined;
+						this.setFlow(ctx, undefined);
 						return this.replyInThread(
 							ctx,
 							r.success ? `✅ Checked in at ${r.formattedTime} (${r.date})` : `❌ ${r.message}`,
@@ -360,25 +372,25 @@ export class TelegramService implements OnModuleInit {
 					}
 				}
 
-				// CHECK-OUT (manual): date -> time -> save
-				if (s.name === 'checkout_manual') {
-					if (s.step === 1) {
+				if (flow.name === 'checkout_manual') {
+					if (flow.step === 1) {
 						const d = this.parseDateOrToday(ctx.message.text, tz);
 						if (!d) return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD` or `today`.');
-						s.data.date = d;
-						s.step = 2;
+						flow.data.date = d;
+						flow.step = 2;
+						this.setFlow(ctx, flow);
 						return this.replyInThread(ctx, '⏰ Time? `HH:mm` (24h)');
 					}
-					if (s.step === 2) {
+					if (flow.step === 2) {
 						const t = this.parseHHmm(ctx.message.text);
 						if (!t) return this.replyInThread(ctx, '❌ Use `HH:mm` (e.g., 18:05).');
-						const ts = this.toUserDate(s.data.date, t.hh, t.mm, tz);
+						const ts = this.toUserDate(flow.data.date, t.hh, t.mm, tz);
 						const r = await this.timeTracking.checkOut(
 							meId,
 							ts,
 							String((ctx.message as any)?.message_id ?? '')
 						);
-						ctx.session.flow = undefined;
+						this.setFlow(ctx, undefined);
 						return this.replyInThread(
 							ctx,
 							r.success
@@ -389,30 +401,28 @@ export class TelegramService implements OnModuleInit {
 					}
 				}
 
-				// MY REPORT (range): start -> end -> report(me)
-				if (s.name === 'my_report_range') {
-					if (s.step === 1) {
+				if (flow.name === 'my_report_range') {
+					if (flow.step === 1) {
 						const d1 = ctx.message.text.trim();
 						if (!moment(d1, 'YYYY-MM-DD', true).isValid())
 							return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD`.');
-						s.data.start = d1;
-						s.step = 2;
+						flow.data.start = d1;
+						flow.step = 2;
+						this.setFlow(ctx, flow);
 						return this.replyInThread(ctx, 'End date? `YYYY-MM-DD`');
 					}
-					if (s.step === 2) {
+					if (flow.step === 2) {
 						const d2 = ctx.message.text.trim();
 						if (!moment(d2, 'YYYY-MM-DD', true).isValid())
 							return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD`.');
-						ctx.session.flow = undefined;
-						const out = await this.reports.getRangeReport(meId, s.data.start, d2);
+						this.setFlow(ctx, undefined);
+						const out = await this.reports.getRangeReport(meId, flow.data.start, d2);
 						return this.replyInThread(ctx, out, { parse_mode: 'Markdown' });
 					}
 				}
 
-				// USER REPORT (range): user -> start -> end -> report(that user)
-				if (s.name === 'user_report_range') {
-					if (s.step === 1) {
-						// detect reply first
+				if (flow.name === 'user_report_range') {
+					if (flow.step === 1) {
 						const m: any = (ctx as any).message;
 						const repliedUserId: string | undefined = m?.reply_to_message?.from?.id
 							? String(m.reply_to_message.from.id)
@@ -440,38 +450,40 @@ export class TelegramService implements OnModuleInit {
 							);
 						}
 
-						s.data.targetId = targetId;
-						s.step = 2;
+						flow.data.targetId = targetId;
+						flow.step = 2;
+						this.setFlow(ctx, flow);
 						return this.replyInThread(ctx, 'Start date? `YYYY-MM-DD`');
 					}
-					if (s.step === 2) {
+					if (flow.step === 2) {
 						const d1 = ctx.message.text.trim();
 						if (!moment(d1, 'YYYY-MM-DD', true).isValid())
 							return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD`.');
-						s.data.start = d1;
-						s.step = 3;
+						flow.data.start = d1;
+						flow.step = 3;
+						this.setFlow(ctx, flow);
 						return this.replyInThread(ctx, 'End date? `YYYY-MM-DD`');
 					}
-					if (s.step === 3) {
+					if (flow.step === 3) {
 						const d2 = ctx.message.text.trim();
 						if (!moment(d2, 'YYYY-MM-DD', true).isValid())
 							return this.replyInThread(ctx, '❌ Use `YYYY-MM-DD`.');
-						const out = await this.reports.getRangeReport(String(s.data.targetId), s.data.start, d2);
-						ctx.session.flow = undefined;
+						const out = await this.reports.getRangeReport(String(flow.data.targetId), flow.data.start, d2);
+						this.setFlow(ctx, undefined);
 						return this.replyInThread(ctx, out, { parse_mode: 'Markdown' });
 					}
 				}
 			} catch (err) {
 				this.logger.error('Flow error', err as any);
-				ctx.session.flow = undefined;
+				this.setFlow(ctx, undefined);
 				await this.replyInThread(ctx, '❌ Flow cancelled due to an error.');
 			}
 		});
 
 		// /cancel
 		this.bot.command('cancel', async (ctx) => {
-			if (ctx.session.flow) {
-				ctx.session.flow = undefined;
+			if (this.getFlow(ctx)) {
+				this.setFlow(ctx, undefined);
 				await this.replyInThread(ctx, '❌ Current flow cancelled.');
 			} else {
 				await this.replyInThread(ctx, 'No active flow.');
