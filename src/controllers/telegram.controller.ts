@@ -1,23 +1,24 @@
-import { Controller, Post, Body, Logger } from '@nestjs/common';
+import { Controller, Post, Body, Logger, Headers } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { TelegramService } from '../services/telegram.service';
 
 @Controller('telegram')
 export class TelegramController {
-  private readonly logger = new Logger(TelegramController.name);
+	private readonly logger = new Logger(TelegramController.name);
 
-  constructor(private telegramService: TelegramService) {}
+	constructor(
+		private readonly telegramService: TelegramService,
+		private readonly config: ConfigService
+	) {}
 
-  @Post('webhook')
-  async webhook(@Body() update: any) {
-    this.logger.log('Received webhook update:', JSON.stringify(update, null, 2));
-
-    try {
-      await this.telegramService.handleUpdate(update);
-      return { status: 'ok' };
-    } catch (error) {
-      this.logger.error('Webhook error:', error);
-      return { status: 'error', message: error.message };
-    }
-  }
+	@Post('webhook')
+	async webhook(@Headers('x-telegram-bot-api-secret-token') token: string, @Body() update: any) {
+		const expected = this.config.get<string>('TELEGRAM_WEBHOOK_SECRET');
+		if (expected && token !== expected) {
+			this.logger.warn('Invalid webhook secret');
+			return { status: 'forbidden' };
+		}
+		await this.telegramService.handleUpdate(update);
+		return { status: 'ok' };
+	}
 }
-

@@ -1,13 +1,20 @@
 import { Context, Telegraf } from 'telegraf';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as moment from 'moment-timezone';
-
+import { Markup } from 'telegraf';
+import * as moment from 'moment-timezone'; // you already import this
 import { ReportService } from './report.service';
 import { TimeTrackingService } from './time-tracking.service';
 import { UserService } from './user.service';
 
-type FlowName = 'checkin_manual' | 'checkout_manual' | 'my_report_range' | 'user_report_range';
+type FlowName =
+	| 'checkin_manual'
+	| 'checkout_manual'
+	| 'my_report_range'
+	| 'user_report_range'
+	| 'checkin_form'
+	| 'checkout_form'
+	| 'report_range_form';
 
 interface FlowState {
 	name: FlowName;
@@ -43,13 +50,15 @@ export class TelegramService implements OnModuleInit {
 
 	async onModuleInit() {
 		const webhookUrl = this.config.get<string>('TELEGRAM_WEBHOOK_URL');
+		const secret = this.config.get<string>('TELEGRAM_WEBHOOK_SECRET');
+
 		if (webhookUrl) {
-			await this.bot.telegram.setWebhook(webhookUrl);
+			await this.bot.telegram.setWebhook(webhookUrl, secret ? { secret_token: secret } : undefined);
 			this.logger.log(`Webhook set to: ${webhookUrl}`);
 		} else {
-			this.logger.warn('TELEGRAM_WEBHOOK_URL is not set; webhook not configured.');
+			await this.bot.launch();
+			this.logger.warn('No TELEGRAM_WEBHOOK_URL set — using long-polling for dev.');
 		}
-		this.logger.log('Telegram bot initialized successfully');
 	}
 
 	getBotInstance() {
@@ -121,7 +130,96 @@ export class TelegramService implements OnModuleInit {
 	}
 
 	// ---------- commands, menu & flows ----------
+	private buildCalendarKeyboard(cursorISO: string) {
+		const cursor = moment(cursorISO, 'YYYY-MM-DD');
+		const year = cursor.year();
+		const month = cursor.month(); // 0..11
 
+		// First day of month and number of days
+		const startOfMonth = cursor.clone().startOf('month');
+		const endOfMonth = cursor.clone().endOf('month');
+		const daysInMonth = endOfMonth.date();
+
+		// Determine leading empty cells (ISO week: Monday=1,...Sunday=7). We’ll use Monday-first layout.
+		const firstWeekday = (startOfMonth.isoWeekday() + 6) % 7; // 0..6 -> Monday..Sunday => 0..6
+		const rows: any[] = [];
+
+		// Header with month navigation
+		const prevMonth = cursor.clone().subtract(1, 'month').format('YYYY-MM-DD');
+		const nextMonth = cursor.clone().add(1, 'month').format('YYYY-MM-DD');
+		rows.push([
+			{ text: '«', callback_data: `cal_nav:${prevMonth}` },
+			{ text: cursor.format('MMMM YYYY'), callback_data: 'noop' },
+			{ text: '»', callback_data: `cal_nav:${nextMonth}` },
+		]);
+
+		// Weekday header
+		rows.push([
+			{ text: 'Mo', callback_data: 'noop' },
+			{ text: 'Tu', callback_data: 'noop' },
+			{ text: 'We', callback_data: 'noop' },
+			{ text: 'Th', callback_data: 'noop' },
+			{ text: 'Fr', callback_data: 'noop' },
+			{ text: 'Sa', callback_data: 'noop' },
+			{ text: 'Su', callback_data: 'noop' },
+		]);
+
+		const buttons: any[] = [];
+		for (let i = 0; i < firstWeekday; i++) {
+			buttons.push({ text: ' ', callback_data: 'noop' });
+		}
+		for (let d = 1; d <= daysInMonth; d++) {
+			const dateStr = cursor.clone().date(d).format('YYYY-MM-DD');
+			buttons.push({ text: String(d), callback_data: `cal_pick:${dateStr}` });
+		}
+		// pad tail to full rows of 7
+		while (buttons.length % 7 !== 0) {
+			buttons.push({ text: ' ', callback_data: 'noop' });
+		}
+		// chunk in rows of 7
+		for (let i = 0; i < buttons.length; i += 7) {
+			rows.push(buttons.slice(i, i + 7));
+		}
+
+		// Footer cancel
+		rows.push([{ text: '✖ Cancel', callback_data: 'cal_cancel' }]);
+
+		return { inline_keyboard: rows };
+	}
+
+	/** Build a time picker (HH:mm) keyboard at a given minute step. Default 15 minutes, business hours 07:00..21:45 */
+	private buildTimeKeyboard(stepMinutes = 15, from = 7, to = 22) {
+		const rows: any[] = [];
+		const times: string[] = [];
+		for (let h = from; h < to; h++) {
+			for (let m = 0; m < 60; m += stepMinutes) {
+				times.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+			}
+		}
+		// 4 per row looks nice
+		for (let i = 0; i < times.length; i += 4) {
+			const chunk = times.slice(i, i + 4).map((t) => ({ text: t, callback_data: `time_pick:${t}` }));
+			rows.push(chunk);
+		}
+		rows.push([{ text: '✖ Cancel', callback_data: 'time_cancel' }]);
+
+		return { inline_keyboard: rows };
+	}
+
+	private async askForDate(ctx: TelegramContext, title: string, cursorISO?: string) {
+		const tz =
+			(await this.users.findByTelegramId(String(ctx.from!.id)))?.timezone ??
+			this.config.get('TIMEZONE') ??
+			'Asia/Tehran';
+		const todayISO = moment.tz(tz).format('YYYY-MM-DD');
+		const keyboard = this.buildCalendarKeyboard(cursorISO || todayISO);
+		return this.replyInThread(ctx, `${title}\n\nانتخاب تاریخ:`, { reply_markup: keyboard });
+	}
+
+	private async askForTime(ctx: TelegramContext, title: string) {
+		const keyboard = this.buildTimeKeyboard(15, 7, 22);
+		return this.replyInThread(ctx, `${title}\n\nانتخاب ساعت:`, { reply_markup: keyboard });
+	}
 	private setupCommandsAndFlows() {
 		// /start
 		this.bot.start(async (ctx) => {
@@ -228,10 +326,15 @@ export class TelegramService implements OnModuleInit {
 				...(threadId ? { message_thread_id: threadId } : {}),
 				reply_markup: {
 					inline_keyboard: [
-						[{ text: '📝 Check-in (manual)', callback_data: 'flow_checkin_manual' }],
-						[{ text: '📝 Check-out (manual)', callback_data: 'flow_checkout_manual' }],
-						[{ text: '📊 My report (range)', callback_data: 'flow_my_report_range' }],
-						[{ text: '👤 User report (range)', callback_data: 'flow_user_report_range' }],
+						// NEW: “real-feeling” forms (inline keyboards)
+						[{ text: '🗓️ Check-in (form)', callback_data: 'form_checkin' }],
+						[{ text: '🗓️ Check-out (form)', callback_data: 'form_checkout' }],
+						[{ text: '📅 Report (range form)', callback_data: 'form_report_range' }],
+						// Existing quick / forms
+						[{ text: '📝 Check-in (manual text)', callback_data: 'flow_checkin_manual' }],
+						[{ text: '📝 Check-out (manual text)', callback_data: 'flow_checkout_manual' }],
+						[{ text: '📊 My report (range - text)', callback_data: 'flow_my_report_range' }],
+						[{ text: '👤 User report (range - text)', callback_data: 'flow_user_report_range' }],
 						[{ text: '📅 Status (today)', callback_data: 'do_status' }],
 					],
 				},
@@ -332,6 +435,192 @@ export class TelegramService implements OnModuleInit {
 				} catch {}
 				await this.replyInThread(ctx, '❌ Failed to start flow.');
 			}
+		});
+
+		// === Start inline-UI flows ===
+		this.bot.action('form_checkin', async (ctx) => {
+			try {
+				this.logCallback(ctx, 'form_checkin');
+				const tz =
+					(await this.users.findByTelegramId(String(ctx.from!.id)))?.timezone ??
+					this.config.get('TIMEZONE') ??
+					'Asia/Tehran';
+				const today = moment.tz(tz).format('YYYY-MM-DD');
+				const flow: FlowState = { name: 'checkin_form', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				this.setFlow(ctx, flow);
+				await ctx.answerCbQuery();
+				await this.askForDate(ctx, '✅ Check-in (form)', today);
+			} catch (e) {
+				this.logger.error('start checkin form failed', e as any);
+				try {
+					await ctx.answerCbQuery('Error');
+				} catch {}
+			}
+		});
+
+		this.bot.action('form_checkout', async (ctx) => {
+			try {
+				this.logCallback(ctx, 'form_checkout');
+				const tz =
+					(await this.users.findByTelegramId(String(ctx.from!.id)))?.timezone ??
+					this.config.get('TIMEZONE') ??
+					'Asia/Tehran';
+				const today = moment.tz(tz).format('YYYY-MM-DD');
+				const flow: FlowState = { name: 'checkout_form', step: 1, data: {}, threadId: this.getThreadId(ctx) };
+				this.setFlow(ctx, flow);
+				await ctx.answerCbQuery();
+				await this.askForDate(ctx, '✅ Check-out (form)', today);
+			} catch (e) {
+				this.logger.error('start checkout form failed', e as any);
+				try {
+					await ctx.answerCbQuery('Error');
+				} catch {}
+			}
+		});
+
+		this.bot.action('form_report_range', async (ctx) => {
+			try {
+				this.logCallback(ctx, 'form_report_range');
+				const tz =
+					(await this.users.findByTelegramId(String(ctx.from!.id)))?.timezone ??
+					this.config.get('TIMEZONE') ??
+					'Asia/Tehran';
+				const today = moment.tz(tz).format('YYYY-MM-DD');
+				const flow: FlowState = {
+					name: 'report_range_form',
+					step: 1,
+					data: {},
+					threadId: this.getThreadId(ctx),
+				};
+				this.setFlow(ctx, flow);
+				await ctx.answerCbQuery();
+				await this.askForDate(ctx, '📊 Report (range) — Start date', today);
+			} catch (e) {
+				this.logger.error('start report form failed', e as any);
+				try {
+					await ctx.answerCbQuery('Error');
+				} catch {}
+			}
+		});
+
+		// === Inline calendar navigation
+		this.bot.action(/cal_nav:(.+)/, async (ctx) => {
+			try {
+				const target = ctx.match![1]; // YYYY-MM-DD
+				await ctx.answerCbQuery();
+				// edit the last calendar message if possible; else send a new one
+				await this.replyInThread(ctx, 'انتخاب تاریخ:', {
+					reply_markup: this.buildCalendarKeyboard(target),
+				});
+			} catch (e) {
+				this.logger.error('cal_nav error', e as any);
+			}
+		});
+
+		this.bot.action(/cal_pick:(\d{4}-\d{2}-\d{2})/, async (ctx) => {
+			try {
+				await ctx.answerCbQuery();
+				const flow = this.getFlow(ctx);
+				if (!flow) return this.replyInThread(ctx, '❌ No active form. Use /menu');
+
+				const pickedDate = ctx.match![1]; // YYYY-MM-DD
+				if (flow.name === 'report_range_form') {
+					if (flow.step === 1) {
+						flow.data.start = pickedDate;
+						flow.step = 2;
+						this.setFlow(ctx, flow);
+						return this.askForDate(ctx, '📊 Report (range) — End date', pickedDate);
+					} else if (flow.step === 2) {
+						flow.data.end = pickedDate;
+						this.setFlow(ctx, undefined);
+						const meId = String(ctx.from!.id);
+						const out = await this.reports.getRangeReport(meId, flow.data.start, flow.data.end);
+						return this.replyInThread(ctx, out, { parse_mode: 'Markdown' });
+					}
+				}
+
+				// checkin/checkout forms
+				flow.data.date = pickedDate;
+				flow.step = 2;
+				this.setFlow(ctx, flow);
+				return this.askForTime(
+					ctx,
+					flow.name === 'checkin_form' ? '✅ Check-in — انتخاب ساعت' : '✅ Check-out — انتخاب ساعت'
+				);
+			} catch (e) {
+				this.logger.error('cal_pick error', e as any);
+			}
+		});
+
+		this.bot.action('cal_cancel', async (ctx) => {
+			try {
+				await ctx.answerCbQuery('Cancelled');
+			} catch {}
+			if (this.getFlow(ctx)) this.setFlow(ctx, undefined);
+			await this.replyInThread(ctx, '❌ Form cancelled.');
+		});
+
+		// === Inline time picker
+		this.bot.action(/time_pick:(\d{2}:\d{2})/, async (ctx) => {
+			try {
+				await ctx.answerCbQuery();
+				const flow = this.getFlow(ctx);
+				if (!flow) return this.replyInThread(ctx, '❌ No active form. Use /menu');
+
+				const pickedTime = ctx.match![1]; // HH:mm
+				const [hh, mm] = pickedTime.split(':').map(Number);
+				const meId = String(ctx.from!.id);
+				const me = await this.users.findByTelegramId(meId);
+				const tz = me?.timezone ?? this.config.get('TIMEZONE') ?? 'Asia/Tehran';
+
+				if (!flow.data?.date) {
+					// Should not happen, but guard anyway
+					return this.replyInThread(ctx, '❌ Pick a date first.');
+				}
+
+				const ts = this.toUserDate(flow.data.date, hh, mm, tz);
+
+				if (flow.name === 'checkin_form') {
+					const r = await this.timeTracking.checkIn(meId, ts);
+					this.setFlow(ctx, undefined);
+					return this.replyInThread(
+						ctx,
+						r.success ? `✅ Checked in at ${r.formattedTime} (${r.date})` : `❌ ${r.message}`,
+						{ parse_mode: 'Markdown' }
+					);
+				}
+
+				if (flow.name === 'checkout_form') {
+					const r = await this.timeTracking.checkOut(meId, ts);
+					this.setFlow(ctx, undefined);
+					return this.replyInThread(
+						ctx,
+						r.success
+							? `✅ Checked out at ${r.formattedTime} (${r.date})\n⏱️ Today: ${r.totalHours} h`
+							: `❌ ${r.message}`,
+						{ parse_mode: 'Markdown' }
+					);
+				}
+
+				return this.replyInThread(ctx, '❌ Unexpected flow. Use /menu');
+			} catch (e) {
+				this.logger.error('time_pick error', e as any);
+			}
+		});
+
+		this.bot.action('time_cancel', async (ctx) => {
+			try {
+				await ctx.answerCbQuery('Cancelled');
+			} catch {}
+			if (this.getFlow(ctx)) this.setFlow(ctx, undefined);
+			await this.replyInThread(ctx, '❌ Form cancelled.');
+		});
+
+		// Prevent “noop” buttons from showing errors
+		this.bot.action('noop', async (ctx) => {
+			try {
+				await ctx.answerCbQuery();
+			} catch {}
 		});
 
 		// ---------- Flow processor (text messages) ----------
